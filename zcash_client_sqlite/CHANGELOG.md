@@ -29,6 +29,10 @@ workspace.
   - `impl zcash_client_backend::data_api::WalletWrite::import_standalone_transparent_script()`
 
 ### Changed
+- The `InputSource::get_spendable_transparent_outputs` implementation now
+  accepts an `output_filter: TransparentOutputFilter` parameter. When set to
+  `CoinbaseOnly`, the SQL query restricts results to outputs from coinbase
+  transactions (identified by `tx_index = 0`).
 - Migrated to `orchard 0.12`, `sapling-crypto 0.6`.
 - `zcash_client_sqlite::error::SqliteClientError` has added variant `GapAddresses`.
 - Renamed `zcash_client_sqlite::error::PubkeyImportConflict` to
