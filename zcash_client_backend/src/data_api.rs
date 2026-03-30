@@ -1463,17 +1463,34 @@ impl NoteFilter {
 /// Controls which transparent outputs are eligible for selection.
 #[cfg(feature = "transparent-inputs")]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u32)]
 pub enum TransparentOutputFilter {
     /// Select all spendable transparent outputs.
     #[default]
-    All,
+    All = 0,
     /// Select only coinbase transparent outputs.
     ///
     /// Coinbase transactions are identified by having `tx_index == 0` within
     /// their containing block. Outputs for which the transaction index is
     /// unknown are conservatively treated as non-coinbase and will be excluded
     /// when this filter is active.
-    CoinbaseOnly,
+    CoinbaseOnly = 1,
+}
+
+impl TransparentOutputFilter {
+    /// Convert to u32 encoding.
+    pub fn into_u32(self) -> u32 {
+        self as u32
+    }
+
+    /// Attempt to parse from `u32` encoding.
+    pub fn parse_from_u32(encoding: u32) -> Option<Self> {
+        Some(match encoding {
+            0 => Self::All,
+            1 => Self::CoinbaseOnly,
+            _ => None?,
+        })
+    }
 }
 
 /// A trait representing the capability to query a data store for unspent transaction outputs

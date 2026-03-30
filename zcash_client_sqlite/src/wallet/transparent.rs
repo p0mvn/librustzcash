@@ -1169,11 +1169,7 @@ pub(crate) fn get_spendable_transparent_outputs<P: consensus::Parameters>(
     confirmations_policy: ConfirmationsPolicy,
     output_filter: TransparentOutputFilter,
 ) -> Result<Vec<WalletUtxo>, SqliteClientError> {
-    let coinbase_only = match output_filter {
-        TransparentOutputFilter::All => 0i32,
-        TransparentOutputFilter::CoinbaseOnly => 1i32,
-    };
-
+    let coinbase_only = output_filter.into_u32();
     let mut stmt_utxos = conn.prepare(&format!(
         "SELECT t.txid, u.output_index, u.script,
                 u.value_zat, addresses.key_scope,
@@ -1195,7 +1191,6 @@ pub(crate) fn get_spendable_transparent_outputs<P: consensus::Parameters>(
         excluding_wallet_internal_ephemeral_outputs("u", "addresses", "t", "accounts"),
         excluding_immature_coinbase_outputs("t"),
     ))?;
-
     let addr_str = address.encode(params);
 
     // We treat all transparent UTXOs as untrusted; however, if zero-conf shielding
