@@ -1477,6 +1477,7 @@ pub enum TransparentOutputFilter {
     CoinbaseOnly = 1,
 }
 
+#[cfg(feature = "transparent-inputs")]
 impl TransparentOutputFilter {
     /// Convert to u32 encoding.
     pub fn into_u32(self) -> u32 {
