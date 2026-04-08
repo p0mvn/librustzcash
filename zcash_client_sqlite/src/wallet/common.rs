@@ -613,6 +613,47 @@ where
     // can be spent even when their shard is not fully scanned.
     let shard_scanned_condition = shard_scanned_condition(protocol);
 
+    // When spendability-pir is active for Orchard, also include witnessed provisional
+    // notes from `pir_notes` (change outputs discovered via trial decryption that are
+    // not yet in the canonical scan). These are appended via UNION ALL so that the
+    // greedy running-sum window function covers both canonical and provisional notes.
+    #[cfg(feature = "spendability-pir")]
+    let include_provisional = matches!(protocol, ShieldedProtocol::Orchard);
+    #[cfg(not(feature = "spendability-pir"))]
+    let include_provisional = false;
+
+    let provisional_union = if include_provisional {
+        format!(
+            "UNION ALL \
+             SELECT \
+                 -(pn.id) AS id, \
+                 COALESCE(pn.spending_tx_hash, zeroblob(32)) AS txid, \
+                 pn.id AS {output_index_col}, \
+                 pn.diversifier, pn.value, \
+                 pn.rho, pn.rseed, \
+                 pn.position AS commitment_tree_position, \
+                 accounts.ufvk AS ufvk, \
+                 1 AS recipient_key_scope, \
+                 pn.spend_height AS mined_height, \
+                 1 AS trust_status, \
+                 NULL AS max_shielding_input_height, \
+                 1 AS min_shielding_input_trust \
+             FROM pir_notes pn \
+             INNER JOIN accounts ON accounts.id = pn.account_id \
+             WHERE accounts.uuid = :account_uuid \
+             AND pn.value > :min_value \
+             AND accounts.ufvk IS NOT NULL \
+             AND pn.canonical_note_id IS NULL \
+             AND pn.is_spent = 0 \
+             AND pn.discovered_by_scanner = 0 \
+             AND pn.witness_siblings IS NOT NULL \
+             AND pn.spend_height IS NOT NULL \
+             AND -(pn.id) NOT IN rarray(:exclude)"
+        )
+    } else {
+        String::new()
+    };
+
     // The goal of this SQL statement is to select the oldest notes until the required
     // value has been reached.
     // 1) Use a window function to create a view of all notes, ordered from oldest to
@@ -628,12 +669,11 @@ where
     //    well as a single note for which the sum was greater than or equal to the
     //    required value, bringing the sum of all selected notes across the threshold.
     let mut stmt_select_notes = conn.prepare_cached(&format!(
-        "WITH eligible AS (
+        "WITH all_notes AS (
              SELECT
                  rn.id AS id, t.txid, rn.{output_index_col},
                  rn.diversifier, rn.value,
                  {note_reconstruction_cols}, rn.commitment_tree_position,
-                 SUM(value) OVER (ROWS UNBOUNDED PRECEDING) AS so_far,
                  accounts.ufvk as ufvk, rn.recipient_key_scope,
                  t.block AS mined_height,
                  IFNULL(t.trust_status, 0) AS trust_status,
@@ -660,8 +700,13 @@ where
              AND ({shard_scanned_condition})
              AND t.block <= :anchor_height
              AND rn.id NOT IN rarray(:exclude)
-             AND rn.id NOT IN ({})
+             AND rn.id NOT IN ({spent_notes})
              GROUP BY rn.id
+             {provisional_union}
+         ),
+         eligible AS (
+             SELECT *, SUM(value) OVER (ROWS UNBOUNDED PRECEDING) AS so_far
+             FROM all_notes
          )
          SELECT id, txid, {output_index_col},
                 diversifier, value, {note_reconstruction_cols}, commitment_tree_position,
@@ -676,7 +721,7 @@ where
                 mined_height, trust_status,
                 max_shielding_input_height, min_shielding_input_trust
          FROM (SELECT * from eligible WHERE so_far >= :target_value LIMIT 1)",
-        spent_notes_clause(table_prefix)
+        spent_notes = spent_notes_clause(table_prefix),
     ))?;
 
     let excluded: Vec<Value> = exclude
@@ -719,11 +764,20 @@ where
             let result_note = result_maybe_note.transpose()?;
             result_note
                 .map(|(note, trusted, tx_shielding_inputs_trusted)| {
+                    // Provisional PIR notes (negative IDs) have an independently-validated
+                    // witness and come from our own spends, so the standard confirmation
+                    // delay does not apply — the PIR witness anchor is used instead of the
+                    // proposal's shard-tree anchor.
+                    #[cfg(feature = "spendability-pir")]
+                    let is_provisional_pir = note.internal_note_id().1 < 0;
+                    #[cfg(not(feature = "spendability-pir"))]
+                    let is_provisional_pir = false;
+
                     let received_height = note
                         .mined_height()
                         .expect("mined height checked to be non-null");
 
-                    let has_confirmations = match note.spending_key_scope() {
+                    let has_confirmations = is_provisional_pir || match note.spending_key_scope() {
                         Scope::Internal => {
                             // The note was has at least `trusted` confirmations.
                             received_height <= trusted_height &&

@@ -29,6 +29,20 @@ use {
     zcash_protocol::consensus,
 };
 
+#[cfg(all(feature = "orchard", feature = "spendability-pir"))]
+use {
+    orchard::{
+        keys::Diversifier,
+        note::{Note as OrchardNote, RandomSeed, Rho},
+    },
+    zcash_client_backend::data_api::wallet::TargetHeight,
+    zcash_keys::keys::UnifiedFullViewingKey,
+    zcash_primitives::transaction::TxId,
+    zcash_protocol::{ShieldedProtocol, consensus::BlockHeight},
+    zip32::Scope,
+    crate::ReceivedNoteId,
+};
+
 // =========================================================================
 // Test infrastructure
 // =========================================================================
@@ -733,25 +747,203 @@ pub fn get_pir_merkle_path(
 
 /// Retrieves a PIR Merkle path by the note's commitment tree position.
 ///
-/// Joins through `orchard_received_notes` to find the matching `note_id`, then
-/// delegates to [`get_pir_merkle_path`].
+/// First checks canonical notes (joined through `orchard_received_notes`), then
+/// falls back to provisional notes (directly in `pir_notes` with
+/// `canonical_note_id IS NULL`) so that PIR-discovered change outputs can be
+/// spent before the scanner reconciles them.
 #[cfg(feature = "orchard")]
 pub fn get_pir_merkle_path_by_position(conn: &Connection, position: Position) -> PirWitnessResult {
-    let note_id: Option<i64> = conn
+    let pos_i64 = u64::from(position) as i64;
+
+    // Try canonical notes first.
+    let canonical_id: Option<i64> = conn
         .query_row(
             "SELECT rn.id FROM orchard_received_notes rn \
              INNER JOIN pir_notes pn ON pn.canonical_note_id = rn.id \
              WHERE rn.commitment_tree_position = ?1 \
              AND pn.witness_siblings IS NOT NULL",
-            [u64::from(position) as i64],
+            [pos_i64],
             |row| row.get(0),
         )
         .optional()?;
 
-    match note_id {
-        Some(id) => get_pir_merkle_path(conn, id, position),
-        None => Ok(None),
+    if let Some(id) = canonical_id {
+        return get_pir_merkle_path(conn, id, position);
     }
+
+    // Fall back to provisional notes (change outputs not yet in the canonical scan).
+    let provisional = conn
+        .query_row(
+            "SELECT witness_siblings, witness_anchor_height, witness_anchor_root \
+             FROM pir_notes \
+             WHERE position = ?1 \
+             AND canonical_note_id IS NULL \
+             AND witness_siblings IS NOT NULL",
+            [pos_i64],
+            |row| {
+                let siblings_blob: Vec<u8> = row.get(0)?;
+                let anchor_height: i64 = row.get(1)?;
+                let anchor_root_blob: Vec<u8> = row.get(2)?;
+                Ok((siblings_blob, anchor_height as u64, anchor_root_blob))
+            },
+        )
+        .optional()?;
+
+    match provisional {
+        None => Ok(None),
+        Some((siblings_blob, anchor_height, anchor_root_blob)) => {
+            let siblings = parse_siblings(&siblings_blob)?;
+            let anchor_root: [u8; 32] = anchor_root_blob.try_into().map_err(|_| {
+                SqliteClientError::CorruptedData(
+                    "pir_notes witness_anchor_root is not 32 bytes".to_string(),
+                )
+            })?;
+
+            let path: Vec<MerkleHashOrchard> = siblings
+                .iter()
+                .map(|bytes| {
+                    Option::from(MerkleHashOrchard::from_bytes(bytes)).ok_or_else(|| {
+                        SqliteClientError::CorruptedData(
+                            "invalid MerkleHashOrchard in pir_notes".to_string(),
+                        )
+                    })
+                })
+                .collect::<Result<_, _>>()?;
+
+            let merkle_path = MerklePath::from_parts(path, position).map_err(|_| {
+                SqliteClientError::CorruptedData(
+                    "failed to construct MerklePath from PIR witness".to_string(),
+                )
+            })?;
+
+            Ok(Some((merkle_path, anchor_height, anchor_root)))
+        }
+    }
+}
+
+/// Looks up a provisional note from `pir_notes` by its row ID and constructs a
+/// [`ReceivedNote`] suitable for transaction building.
+///
+/// This is the fallback used by `get_spendable_note` when the proposal references
+/// an Orchard input with a zero txid — the marker for provisional PIR notes whose
+/// `pir_notes.id` is encoded in the action_index field.
+#[cfg(all(feature = "orchard", feature = "spendability-pir"))]
+pub fn get_spendable_provisional_note<P: consensus::Parameters>(
+    conn: &Connection,
+    params: &P,
+    pir_note_id: u32,
+    _target_height: TargetHeight,
+) -> Result<Option<ReceivedNote<ReceivedNoteId, OrchardNote>>, SqliteClientError> {
+    let row = conn
+        .query_row(
+            "SELECT pn.id, pn.diversifier, pn.value, pn.rho, pn.rseed, \
+                    pn.position AS commitment_tree_position, \
+                    accounts.ufvk, pn.spend_height AS mined_height \
+             FROM pir_notes pn \
+             INNER JOIN accounts ON accounts.id = pn.account_id \
+             WHERE pn.id = :pir_note_id \
+               AND pn.is_spent = 0 \
+               AND pn.witness_siblings IS NOT NULL \
+               AND accounts.ufvk IS NOT NULL",
+            named_params! { ":pir_note_id": pir_note_id },
+            |row| {
+                let id: i64 = row.get("id")?;
+                let diversifier_bytes: Vec<u8> = row.get("diversifier")?;
+                let value: i64 = row.get("value")?;
+                let rho_bytes: [u8; 32] = row.get("rho")?;
+                let rseed_bytes: [u8; 32] = row.get("rseed")?;
+                let position: i64 = row.get("commitment_tree_position")?;
+                let ufvk_str: String = row.get("ufvk")?;
+                let mined_height: Option<u32> = row.get("mined_height")?;
+                Ok((
+                    id,
+                    diversifier_bytes,
+                    value,
+                    rho_bytes,
+                    rseed_bytes,
+                    position,
+                    ufvk_str,
+                    mined_height,
+                ))
+            },
+        )
+        .optional()?;
+
+    let Some((id, diversifier_bytes, value, rho_bytes, rseed_bytes, position, ufvk_str, mined_height)) =
+        row
+    else {
+        return Ok(None);
+    };
+
+    let note_id = ReceivedNoteId(ShieldedProtocol::Orchard, -id);
+
+    let diversifier = {
+        if diversifier_bytes.len() != 11 {
+            return Err(SqliteClientError::CorruptedData(
+                "Invalid diversifier length in pir_notes".to_string(),
+            ));
+        }
+        let mut tmp = [0u8; 11];
+        tmp.copy_from_slice(&diversifier_bytes);
+        Diversifier::from_bytes(tmp)
+    };
+
+    let note_value: u64 = value.try_into().map_err(|_| {
+        SqliteClientError::CorruptedData("Provisional note value must be nonnegative".to_string())
+    })?;
+
+    let rho = Option::from(Rho::from_bytes(&rho_bytes))
+        .ok_or_else(|| SqliteClientError::CorruptedData("Invalid rho in pir_notes".to_string()))?;
+
+    let rseed = Option::from(RandomSeed::from_bytes(rseed_bytes, &rho)).ok_or_else(|| {
+        SqliteClientError::CorruptedData("Invalid rseed in pir_notes".to_string())
+    })?;
+
+    let note_commitment_tree_position = Position::from(u64::try_from(position).map_err(|_| {
+        SqliteClientError::CorruptedData("Invalid position in pir_notes".to_string())
+    })?);
+
+    let ufvk = UnifiedFullViewingKey::decode(params, &ufvk_str)
+        .map_err(SqliteClientError::CorruptedData)?;
+
+    let spending_key_scope = Scope::Internal;
+
+    let recipient = ufvk
+        .orchard()
+        .map(|fvk| fvk.to_ivk(spending_key_scope).address(diversifier))
+        .ok_or_else(|| {
+            SqliteClientError::CorruptedData(
+                "UFVK missing Orchard key for provisional note".to_string(),
+            )
+        })?;
+
+    let note = Option::from(OrchardNote::from_parts(
+        recipient,
+        orchard::value::NoteValue::from_raw(note_value),
+        rho,
+        rseed,
+    ))
+    .ok_or_else(|| {
+        SqliteClientError::CorruptedData("Invalid provisional Orchard note".to_string())
+    })?;
+
+    let action_index = u16::try_from(pir_note_id).map_err(|_| {
+        SqliteClientError::CorruptedData(format!(
+            "pir_notes.id {} exceeds u16 range for action_index",
+            pir_note_id
+        ))
+    })?;
+
+    Ok(Some(ReceivedNote::from_parts(
+        note_id,
+        TxId::from_bytes([0u8; 32]),
+        action_index,
+        note,
+        spending_key_scope,
+        note_commitment_tree_position,
+        mined_height.map(BlockHeight::from),
+        None,
+    )))
 }
 
 /// Validates a PIR-obtained Merkle witness against the note's commitment.

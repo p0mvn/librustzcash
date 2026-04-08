@@ -833,14 +833,28 @@ impl<C: Borrow<rusqlite::Connection>, P: consensus::Parameters, CL, R> InputSour
             .map(|opt| opt.map(|n| n.map_note(Note::Sapling))),
             ShieldedProtocol::Orchard => {
                 #[cfg(feature = "orchard")]
-                return wallet::orchard::get_spendable_orchard_note(
-                    self.conn.borrow(),
-                    &self.params,
-                    txid,
-                    index,
-                    target_height,
-                )
-                .map(|opt| opt.map(|n| n.map_note(Note::Orchard)));
+                {
+                    let result = wallet::orchard::get_spendable_orchard_note(
+                        self.conn.borrow(),
+                        &self.params,
+                        txid,
+                        index,
+                        target_height,
+                    );
+
+                    #[cfg(feature = "spendability-pir")]
+                    if matches!(&result, Ok(None)) && txid == &TxId::from_bytes([0u8; 32]) {
+                        return wallet::pir::get_spendable_provisional_note(
+                            self.conn.borrow(),
+                            &self.params,
+                            index,
+                            target_height,
+                        )
+                        .map(|opt| opt.map(|n| n.map_note(Note::Orchard)));
+                    }
+
+                    return result.map(|opt| opt.map(|n| n.map_note(Note::Orchard)));
+                }
 
                 #[cfg(not(feature = "orchard"))]
                 return Err(SqliteClientError::UnsupportedPoolType(PoolType::ORCHARD));
