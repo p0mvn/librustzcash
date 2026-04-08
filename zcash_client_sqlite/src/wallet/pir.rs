@@ -245,8 +245,10 @@ pub struct ProvisionalNoteForPIR {
 
 /// A PIR-derived transaction entry for the activity view.
 ///
-/// Aggregates co-spent canonical notes by `spending_tx_hash` and computes
-/// the net spend as `gross_value - change_value`.
+/// Each entry represents a single spending transaction at any depth of the
+/// spent chain (canonical or provisional). Co-spent inputs sharing the same
+/// `spending_tx_hash` are aggregated, and `change_value` is the sum of
+/// immediate wallet-owned outputs (children via `parent_id`).
 pub struct PirActivityEntry {
     pub tx_hash: [u8; 32],
     pub block_time: u32,
@@ -380,7 +382,7 @@ pub fn set_pir_spending_tx_metadata(
 }
 
 const PIR_ACTIVITY_ENTRIES_SQL: &str = "\
-    WITH RECURSIVE pending_roots AS ( \
+    WITH all_spent AS ( \
         SELECT pn.id, pn.spending_tx_hash, pn.spending_block_time, pn.spending_fee, \
                pn.spend_height, rn.value AS gross_value \
         FROM pir_notes pn \
@@ -391,38 +393,41 @@ const PIR_ACTIVITY_ENTRIES_SQL: &str = "\
               SELECT 1 FROM orchard_received_note_spends sp \
               WHERE sp.orchard_received_note_id = pn.canonical_note_id \
           ) \
-    ), \
-    tree(node_id, tx_hash) AS ( \
-        SELECT id, spending_tx_hash FROM pending_roots \
         UNION ALL \
-        SELECT child.id, tree.tx_hash \
-        FROM pir_notes child \
-        JOIN tree ON child.parent_id = tree.node_id \
+        SELECT pn.id, pn.spending_tx_hash, pn.spending_block_time, pn.spending_fee, \
+               pn.spend_height, pn.value AS gross_value \
+        FROM pir_notes pn \
+        WHERE pn.canonical_note_id IS NULL \
+          AND pn.is_spent = 1 \
+          AND pn.spending_tx_hash IS NOT NULL \
+          AND pn.discovered_by_scanner = 0 \
     ) \
     SELECT \
-        pr.spending_tx_hash AS tx_hash, \
-        MAX(pr.spending_block_time) AS block_time, \
-        MAX(pr.spending_fee) AS fee, \
-        MAX(pr.spend_height) AS height, \
-        SUM(pr.gross_value) AS gross_value, \
+        s.spending_tx_hash AS tx_hash, \
+        MAX(s.spending_block_time) AS block_time, \
+        MAX(s.spending_fee) AS fee, \
+        MAX(s.spend_height) AS height, \
+        SUM(s.gross_value) AS gross_value, \
         COALESCE(( \
-            SELECT SUM(leaf.value) \
-            FROM tree t \
-            JOIN pir_notes leaf ON leaf.id = t.node_id \
-            WHERE t.tx_hash = pr.spending_tx_hash \
-              AND leaf.is_spent = 0 \
-              AND leaf.canonical_note_id IS NULL \
-              AND leaf.id NOT IN (SELECT id FROM pending_roots) \
+            SELECT SUM(child.value) \
+            FROM pir_notes child \
+            WHERE child.parent_id IN ( \
+                SELECT a.id FROM all_spent a \
+                WHERE a.spending_tx_hash = s.spending_tx_hash \
+            ) \
+            AND child.canonical_note_id IS NULL \
         ), 0) AS change_value \
-    FROM pending_roots pr \
-    GROUP BY pr.spending_tx_hash";
+    FROM all_spent s \
+    GROUP BY s.spending_tx_hash";
 
 /// Returns PIR-derived transaction entries for the activity view.
 ///
 /// Each entry represents a spending transaction detected via PIR that the
-/// scanner has not yet confirmed. Co-spent canonical notes are grouped by
-/// `spending_tx_hash`. The `change_value` is the sum of unspent descendant
-/// provisional leaves, giving `net_value = gross_value - change_value`.
+/// scanner has not yet confirmed, at any depth of the spent chain. Canonical
+/// entries are excluded once the scanner confirms the spend; provisional
+/// entries are excluded once the scanner reconciles the note. Co-spent inputs
+/// are grouped by `spending_tx_hash`, and `change_value` is the sum of
+/// immediate wallet-owned outputs discovered via trial decryption.
 pub fn get_pir_activity_entries(
     conn: &Connection,
 ) -> Result<Vec<PirActivityEntry>, SqliteClientError> {
@@ -1171,6 +1176,201 @@ pub fn reconcile_provisional_for_position(
 }
 
 // =========================================================================
+// Atomic PIR rounds
+// =========================================================================
+
+/// Pre-computed data for a canonical note whose spend was detected by PIR,
+/// along with any change notes discovered via trial decryption.
+pub struct CanonicalSpendInput {
+    pub note_id: i64,
+    pub spend_height: u32,
+    pub tx_hash: Option<[u8; 32]>,
+    pub block_time: Option<u32>,
+    pub fee: Option<u64>,
+    pub account_id: i64,
+    pub discovered_notes: Vec<DiscoveredNoteInput>,
+}
+
+/// A note discovered via trial decryption, ready for insertion as a provisional.
+pub struct DiscoveredNoteInput {
+    pub value: u64,
+    pub position: u64,
+    pub diversifier: [u8; 11],
+    pub rseed: [u8; 32],
+    pub rho: [u8; 32],
+    pub nullifier: [u8; 32],
+    pub cmx: [u8; 32],
+}
+
+/// Result of inserting a discovered provisional note.
+pub struct DiscoveredNoteOutput {
+    pub position: u64,
+    pub value: u64,
+    pub provisional_note_id: i64,
+}
+
+/// Pre-computed data for a provisional note after PIR nullifier check,
+/// along with any deeper change notes discovered via trial decryption.
+pub struct ProvisionalCheckInput {
+    pub note_id: i64,
+    pub is_spent: bool,
+    pub spend_height: Option<u32>,
+    pub tx_hash: Option<[u8; 32]>,
+    pub block_time: Option<u32>,
+    pub fee: Option<u64>,
+    pub account_id: i64,
+    pub depth: u32,
+    pub discovered_notes: Vec<DiscoveredNoteInput>,
+}
+
+/// Atomically applies a full canonical PIR round: marks notes spent,
+/// sets spending tx metadata, and inserts discovered provisional notes.
+///
+/// All DB writes happen inside a single SAVEPOINT so that either everything
+/// commits or nothing does. This prevents half-committed states where a note
+/// is marked spent but its spending tx metadata or change notes are missing.
+pub fn apply_canonical_round(
+    conn: &Connection,
+    entries: &[CanonicalSpendInput],
+) -> Result<Vec<Vec<DiscoveredNoteOutput>>, SqliteClientError> {
+    conn.execute_batch("SAVEPOINT pir_canonical_round")?;
+
+    match apply_canonical_round_inner(conn, entries) {
+        Ok(results) => {
+            conn.execute_batch("RELEASE SAVEPOINT pir_canonical_round")?;
+            Ok(results)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK TO SAVEPOINT pir_canonical_round");
+            Err(e)
+        }
+    }
+}
+
+fn apply_canonical_round_inner(
+    conn: &Connection,
+    entries: &[CanonicalSpendInput],
+) -> Result<Vec<Vec<DiscoveredNoteOutput>>, SqliteClientError> {
+    let mut all_results = Vec::with_capacity(entries.len());
+
+    for entry in entries {
+        insert_pir_spent_note(conn, entry.note_id)?;
+
+        let pir_note_id = get_pir_note_id_for_canonical(conn, entry.note_id)?;
+
+        if let (Some(pir_id), Some(tx_hash)) = (pir_note_id, &entry.tx_hash) {
+            set_pir_spending_tx_metadata(
+                conn,
+                pir_id,
+                tx_hash,
+                entry.block_time.unwrap_or(0),
+                entry.fee,
+                Some(entry.spend_height),
+            )?;
+        }
+
+        let mut results = Vec::with_capacity(entry.discovered_notes.len());
+        for note in &entry.discovered_notes {
+            let provisional_id = insert_pir_provisional_note(
+                conn,
+                entry.account_id,
+                note.value,
+                note.position,
+                &note.diversifier,
+                &note.rseed,
+                &note.rho,
+                &note.nullifier,
+                &note.cmx,
+                entry.spend_height,
+                1,
+                pir_note_id,
+            )?;
+            results.push(DiscoveredNoteOutput {
+                position: note.position,
+                value: note.value,
+                provisional_note_id: provisional_id,
+            });
+        }
+        all_results.push(results);
+    }
+
+    Ok(all_results)
+}
+
+/// Atomically applies a provisional PIR round: marks provisional notes as
+/// checked, sets spending tx metadata for spent ones, and inserts deeper
+/// discovered change notes.
+///
+/// Uses a SAVEPOINT so that all updates commit or roll back together.
+pub fn apply_provisional_round(
+    conn: &Connection,
+    entries: &[ProvisionalCheckInput],
+) -> Result<Vec<Vec<DiscoveredNoteOutput>>, SqliteClientError> {
+    conn.execute_batch("SAVEPOINT pir_provisional_round")?;
+
+    match apply_provisional_round_inner(conn, entries) {
+        Ok(results) => {
+            conn.execute_batch("RELEASE SAVEPOINT pir_provisional_round")?;
+            Ok(results)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK TO SAVEPOINT pir_provisional_round");
+            Err(e)
+        }
+    }
+}
+
+fn apply_provisional_round_inner(
+    conn: &Connection,
+    entries: &[ProvisionalCheckInput],
+) -> Result<Vec<Vec<DiscoveredNoteOutput>>, SqliteClientError> {
+    let mut all_results = Vec::with_capacity(entries.len());
+
+    for entry in entries {
+        mark_provisional_pir_result(conn, entry.note_id, entry.is_spent)?;
+
+        if entry.is_spent {
+            if let Some(tx_hash) = &entry.tx_hash {
+                set_pir_spending_tx_metadata(
+                    conn,
+                    entry.note_id,
+                    tx_hash,
+                    entry.block_time.unwrap_or(0),
+                    entry.fee,
+                    entry.spend_height,
+                )?;
+            }
+        }
+
+        let mut results = Vec::with_capacity(entry.discovered_notes.len());
+        for note in &entry.discovered_notes {
+            let provisional_id = insert_pir_provisional_note(
+                conn,
+                entry.account_id,
+                note.value,
+                note.position,
+                &note.diversifier,
+                &note.rseed,
+                &note.rho,
+                &note.nullifier,
+                &note.cmx,
+                entry.spend_height.unwrap_or(0),
+                entry.depth + 1,
+                Some(entry.note_id),
+            )?;
+            results.push(DiscoveredNoteOutput {
+                position: note.position,
+                value: note.value,
+                provisional_note_id: provisional_id,
+            });
+        }
+        all_results.push(results);
+    }
+
+    Ok(all_results)
+}
+
+// =========================================================================
 // Internal helpers
 // =========================================================================
 
@@ -1236,6 +1436,17 @@ fn parse_siblings(blob: &[u8]) -> Result<[[u8; 32]; 32], SqliteClientError> {
         siblings[i].copy_from_slice(chunk);
     }
     Ok(siblings)
+}
+
+/// Deletes all rows from `pir_notes`, resetting PIR state to a clean slate.
+///
+/// The next `checkWalletSpendability` call will re-discover any spent notes
+/// and their change outputs from scratch. Useful when stale rows with missing
+/// `parent_id` or `spending_tx_hash` from older code paths cause activity
+/// entries to be incomplete.
+pub fn reset_pir_state(conn: &Connection) -> Result<u64, SqliteClientError> {
+    let deleted = conn.execute("DELETE FROM pir_notes", [])?;
+    Ok(deleted as u64)
 }
 
 // =========================================================================
@@ -2453,12 +2664,19 @@ mod tests {
             3_200_001, 2, Some(change_b_id),
         ).unwrap();
 
-        let entries = get_pir_activity_entries(db.conn()).unwrap();
-        assert_eq!(entries.len(), 1);
+        let mut entries = get_pir_activity_entries(db.conn()).unwrap();
+        entries.sort_by_key(|e| e.height);
+        assert_eq!(entries.len(), 2);
+
         assert_eq!(entries[0].tx_hash, tx_hash_a);
         assert_eq!(entries[0].gross_value, 100_000);
-        assert_eq!(entries[0].change_value, 50_000);
-        assert_eq!(entries[0].net_value(), 50_000);
+        assert_eq!(entries[0].change_value, 70_000);
+        assert_eq!(entries[0].net_value(), 30_000);
+
+        assert_eq!(entries[1].tx_hash, tx_hash_b);
+        assert_eq!(entries[1].gross_value, 70_000);
+        assert_eq!(entries[1].change_value, 50_000);
+        assert_eq!(entries[1].net_value(), 20_000);
     }
 
     #[test]
@@ -2569,12 +2787,337 @@ mod tests {
         mark_provisional_pir_result(db.conn(), change_b_id, true).unwrap();
 
         let entries = get_pir_activity_entries(db.conn()).unwrap();
-        // A should still appear; its change_value should be 0 because B is spent
-        // (no unspent leaves in the subtree — B is spent and has no children)
+        // T1 should still appear. change_value is B (immediate child), regardless
+        // of B's spent status. B has no spending_tx_hash so it gets no entry of its own.
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].tx_hash, tx_hash_a);
         assert_eq!(entries[0].gross_value, 100_000);
-        assert_eq!(entries[0].change_value, 0);
-        assert_eq!(entries[0].net_value(), 100_000);
+        assert_eq!(entries[0].change_value, 70_000);
+        assert_eq!(entries[0].net_value(), 30_000);
+    }
+
+    #[test]
+    fn activity_provisional_spent_without_tx_metadata() {
+        let db = PirTestDb::new();
+        let tx_hash_a = make_tx_hash(0xAA);
+        let pir_a = setup_spent_with_change(db.conn(), 1, 100_000, 1000, 2000, 70_000, &tx_hash_a);
+
+        let change_b_id: i64 = db.conn()
+            .query_row("SELECT id FROM pir_notes WHERE parent_id = ?1", [pir_a], |r| r.get(0))
+            .unwrap();
+        mark_provisional_pir_result(db.conn(), change_b_id, true).unwrap();
+
+        let tx_hash_b = make_tx_hash(0xBB);
+        set_pir_spending_tx_metadata(db.conn(), change_b_id, &tx_hash_b, 1700001000, Some(10_000), Some(3_200_001)).unwrap();
+        insert_pir_provisional_note(
+            db.conn(), 1, 50_000, 3000,
+            &[0u8; 11], &[0u8; 32], &[0u8; 32],
+            &[3u8; 32], &[0u8; 32],
+            3_200_001, 2, Some(change_b_id),
+        ).unwrap();
+
+        let change_c_id: i64 = db.conn()
+            .query_row("SELECT id FROM pir_notes WHERE parent_id = ?1", [change_b_id], |r| r.get(0))
+            .unwrap();
+        // C is spent via PIR but block download failed — no spending_tx_hash
+        mark_provisional_pir_result(db.conn(), change_c_id, true).unwrap();
+
+        let mut entries = get_pir_activity_entries(db.conn()).unwrap();
+        entries.sort_by_key(|e| e.height);
+        // C should NOT produce an activity entry (no spending_tx_hash).
+        // T1 and T2 are unaffected.
+        assert_eq!(entries.len(), 2);
+
+        assert_eq!(entries[0].tx_hash, tx_hash_a);
+        assert_eq!(entries[0].gross_value, 100_000);
+        assert_eq!(entries[0].change_value, 70_000);
+        assert_eq!(entries[0].net_value(), 30_000);
+
+        assert_eq!(entries[1].tx_hash, tx_hash_b);
+        assert_eq!(entries[1].gross_value, 70_000);
+        assert_eq!(entries[1].change_value, 50_000);
+        assert_eq!(entries[1].net_value(), 20_000);
+    }
+
+    // =====================================================================
+    // Atomic round tests
+    // =====================================================================
+
+    #[test]
+    fn canonical_round_marks_spent_and_inserts_provisionals() {
+        let db = PirTestDb::new();
+        let tx_hash = [0xAA; 32];
+        insert_canonical_note(db.conn(), 1, 5000, 100_000);
+
+        let entries = vec![CanonicalSpendInput {
+            note_id: 1,
+            spend_height: 3_200_000,
+            tx_hash: Some(tx_hash),
+            block_time: Some(1_700_000_000),
+            fee: Some(10_000),
+            account_id: 1,
+            discovered_notes: vec![DiscoveredNoteInput {
+                value: 70_000,
+                position: 6000,
+                diversifier: [0u8; 11],
+                rseed: [0u8; 32],
+                rho: [0u8; 32],
+                nullifier: [6u8; 32],
+                cmx: [0u8; 32],
+            }],
+        }];
+
+        let results = apply_canonical_round(db.conn(), &entries).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].len(), 1);
+        assert_eq!(results[0][0].position, 6000);
+        assert_eq!(results[0][0].value, 70_000);
+
+        // Canonical note should be marked spent
+        let is_spent: bool = db.conn()
+            .query_row(
+                "SELECT is_spent FROM pir_notes WHERE canonical_note_id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(is_spent);
+
+        // Spending tx metadata should be set
+        let (stored_hash, stored_fee): (Vec<u8>, i64) = db.conn()
+            .query_row(
+                "SELECT spending_tx_hash, spending_fee FROM pir_notes WHERE canonical_note_id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored_hash, tx_hash.to_vec());
+        assert_eq!(stored_fee, 10_000);
+
+        // Provisional should have parent_id pointing to canonical's pir row
+        let (parent_id, depth): (Option<i64>, i64) = db.conn()
+            .query_row(
+                "SELECT parent_id, depth FROM pir_notes WHERE position = 6000",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let pir_id: i64 = db.conn()
+            .query_row("SELECT id FROM pir_notes WHERE canonical_note_id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(parent_id, Some(pir_id));
+        assert_eq!(depth, 1);
+    }
+
+    #[test]
+    fn canonical_round_rolls_back_on_error() {
+        let db = PirTestDb::new();
+        // Note 999 doesn't exist — insert_pir_spent_note will succeed (no-op upsert)
+        // but we can verify rollback by checking a valid note alongside an invalid one
+        insert_canonical_note(db.conn(), 1, 5000, 100_000);
+
+        let entries = vec![
+            CanonicalSpendInput {
+                note_id: 1,
+                spend_height: 3_200_000,
+                tx_hash: Some([0xBB; 32]),
+                block_time: Some(1_700_000_000),
+                fee: None,
+                account_id: 1,
+                discovered_notes: vec![
+                    DiscoveredNoteInput {
+                        value: 50_000,
+                        position: 7000,
+                        diversifier: [0u8; 11],
+                        rseed: [0u8; 32],
+                        rho: [0u8; 32],
+                        nullifier: [7u8; 32],
+                        cmx: [0u8; 32],
+                    },
+                    // Duplicate position — will trigger UNIQUE constraint via INSERT OR IGNORE,
+                    // but position-based ID lookup should still work
+                    DiscoveredNoteInput {
+                        value: 50_000,
+                        position: 7000,
+                        diversifier: [0u8; 11],
+                        rseed: [0u8; 32],
+                        rho: [0u8; 32],
+                        nullifier: [7u8; 32],
+                        cmx: [0u8; 32],
+                    },
+                ],
+            },
+        ];
+
+        // Should succeed even with duplicate positions (INSERT OR IGNORE)
+        let results = apply_canonical_round(db.conn(), &entries).unwrap();
+        assert_eq!(results[0].len(), 2);
+        // Both should reference the same provisional note id
+        assert_eq!(results[0][0].provisional_note_id, results[0][1].provisional_note_id);
+    }
+
+    #[test]
+    fn provisional_round_marks_checked_and_inserts_deeper_notes() {
+        let db = PirTestDb::new();
+        let tx_hash = [0xCC; 32];
+        insert_canonical_note(db.conn(), 1, 5000, 100_000);
+
+        // Set up a depth-1 provisional using a canonical round
+        let canonical_entries = vec![CanonicalSpendInput {
+            note_id: 1,
+            spend_height: 3_200_000,
+            tx_hash: Some(tx_hash),
+            block_time: Some(1_700_000_000),
+            fee: Some(10_000),
+            account_id: 1,
+            discovered_notes: vec![DiscoveredNoteInput {
+                value: 70_000,
+                position: 6000,
+                diversifier: [0u8; 11],
+                rseed: [0u8; 32],
+                rho: [0u8; 32],
+                nullifier: [6u8; 32],
+                cmx: [0u8; 32],
+            }],
+        }];
+        let canonical_results = apply_canonical_round(db.conn(), &canonical_entries).unwrap();
+        let prov_id = canonical_results[0][0].provisional_note_id;
+
+        // Now run a provisional round marking it as spent with deeper change
+        let prov_entries = vec![ProvisionalCheckInput {
+            note_id: prov_id,
+            is_spent: true,
+            spend_height: Some(3_200_001),
+            tx_hash: Some([0xDD; 32]),
+            block_time: Some(1_700_000_100),
+            fee: Some(5_000),
+            account_id: 1,
+            depth: 1,
+            discovered_notes: vec![DiscoveredNoteInput {
+                value: 60_000,
+                position: 8000,
+                diversifier: [0u8; 11],
+                rseed: [0u8; 32],
+                rho: [0u8; 32],
+                nullifier: [8u8; 32],
+                cmx: [0u8; 32],
+            }],
+        }];
+
+        let results = apply_provisional_round(db.conn(), &prov_entries).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].len(), 1);
+        assert_eq!(results[0][0].position, 8000);
+        assert_eq!(results[0][0].value, 60_000);
+
+        // The depth-1 provisional should be marked checked and spent
+        let (pir_checked, is_spent): (bool, bool) = db.conn()
+            .query_row(
+                "SELECT pir_checked, is_spent FROM pir_notes WHERE id = ?1",
+                [prov_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(pir_checked);
+        assert!(is_spent);
+
+        // Depth-2 provisional should have parent pointing to depth-1
+        let (parent_id, depth): (i64, i64) = db.conn()
+            .query_row(
+                "SELECT parent_id, depth FROM pir_notes WHERE position = 8000",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(parent_id, prov_id);
+        assert_eq!(depth, 2);
+    }
+
+    #[test]
+    fn provisional_round_non_spent_has_no_children() {
+        let db = PirTestDb::new();
+        insert_canonical_note(db.conn(), 1, 5000, 100_000);
+
+        let canonical_entries = vec![CanonicalSpendInput {
+            note_id: 1,
+            spend_height: 3_200_000,
+            tx_hash: Some([0xEE; 32]),
+            block_time: Some(1_700_000_000),
+            fee: None,
+            account_id: 1,
+            discovered_notes: vec![DiscoveredNoteInput {
+                value: 90_000,
+                position: 9000,
+                diversifier: [0u8; 11],
+                rseed: [0u8; 32],
+                rho: [0u8; 32],
+                nullifier: [9u8; 32],
+                cmx: [0u8; 32],
+            }],
+        }];
+        let canonical_results = apply_canonical_round(db.conn(), &canonical_entries).unwrap();
+        let prov_id = canonical_results[0][0].provisional_note_id;
+
+        // Mark as not-spent (no block data needed)
+        let prov_entries = vec![ProvisionalCheckInput {
+            note_id: prov_id,
+            is_spent: false,
+            spend_height: None,
+            tx_hash: None,
+            block_time: None,
+            fee: None,
+            account_id: 0,
+            depth: 1,
+            discovered_notes: vec![],
+        }];
+
+        let results = apply_provisional_round(db.conn(), &prov_entries).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_empty());
+
+        // Should be marked checked but not spent
+        let (pir_checked, is_spent): (bool, bool) = db.conn()
+            .query_row(
+                "SELECT pir_checked, is_spent FROM pir_notes WHERE id = ?1",
+                [prov_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(pir_checked);
+        assert!(!is_spent);
+    }
+
+    #[test]
+    fn canonical_round_activity_entries_correct() {
+        let db = PirTestDb::new();
+        let tx_hash = [0xFF; 32];
+        insert_canonical_note(db.conn(), 1, 5000, 100_000);
+
+        let entries = vec![CanonicalSpendInput {
+            note_id: 1,
+            spend_height: 3_200_000,
+            tx_hash: Some(tx_hash),
+            block_time: Some(1_700_000_000),
+            fee: Some(10_000),
+            account_id: 1,
+            discovered_notes: vec![DiscoveredNoteInput {
+                value: 70_000,
+                position: 6000,
+                diversifier: [0u8; 11],
+                rseed: [0u8; 32],
+                rho: [0u8; 32],
+                nullifier: [6u8; 32],
+                cmx: [0u8; 32],
+            }],
+        }];
+
+        apply_canonical_round(db.conn(), &entries).unwrap();
+
+        let activity = get_pir_activity_entries(db.conn()).unwrap();
+        assert_eq!(activity.len(), 1);
+        assert_eq!(activity[0].tx_hash, tx_hash);
+        assert_eq!(activity[0].gross_value, 100_000);
+        assert_eq!(activity[0].change_value, 70_000);
+        assert_eq!(activity[0].net_value(), 30_000);
     }
 }

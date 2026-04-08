@@ -687,6 +687,31 @@ impl<C: Borrow<Connection>, P, CL, R> WalletDb<C, P, CL, R> {
             is_spent,
         )
     }
+
+    /// Atomically applies a canonical PIR round: marks notes spent, sets spending
+    /// tx metadata, and inserts discovered provisional change notes — all inside a
+    /// single SAVEPOINT.
+    pub fn apply_canonical_round(
+        &self,
+        entries: &[wallet::pir::CanonicalSpendInput],
+    ) -> Result<Vec<Vec<wallet::pir::DiscoveredNoteOutput>>, SqliteClientError> {
+        wallet::pir::apply_canonical_round(self.conn.borrow(), entries)
+    }
+
+    /// Atomically applies a provisional PIR round: marks provisional notes as
+    /// checked, sets spending tx metadata for spent ones, and inserts deeper
+    /// discovered change notes — all inside a single SAVEPOINT.
+    pub fn apply_provisional_round(
+        &self,
+        entries: &[wallet::pir::ProvisionalCheckInput],
+    ) -> Result<Vec<Vec<wallet::pir::DiscoveredNoteOutput>>, SqliteClientError> {
+        wallet::pir::apply_provisional_round(self.conn.borrow(), entries)
+    }
+
+    /// Deletes all rows from `pir_notes`, returning the number of rows deleted.
+    pub fn reset_pir_state(&self) -> Result<u64, SqliteClientError> {
+        wallet::pir::reset_pir_state(self.conn.borrow())
+    }
 }
 
 #[cfg(feature = "transparent-inputs")]
