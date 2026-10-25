@@ -108,7 +108,7 @@ jobs:
           elif [[ -n "$FEATURES" ]]; then
             feature_flags+=(--features "$FEATURES")
           fi
-          cargo test --workspace "${feature_flags[@]}" -- --test-threads=2
+          cargo test --locked --workspace "${feature_flags[@]}" -- --test-threads=2
       - name: Verify working directory is clean
         run: git diff --exit-code
 
@@ -164,7 +164,7 @@ jobs:
           elif [[ -n "$FEATURES" ]]; then
             feature_flags+=(--features "$FEATURES")
           fi
-          cargo check --workspace --all-targets "${feature_flags[@]}"
+          cargo check --locked --workspace --all-targets "${feature_flags[@]}"
       - name: Feature configuration runtime coverage
         if: ${{ github.event_name != 'pull_request' }}
         run: echo "The full feature matrix runs tests for this event."
@@ -226,7 +226,7 @@ jobs:
           elif [[ -n "$FEATURES" ]]; then
             feature_flags+=(--features "$FEATURES")
           fi
-          cargo test --workspace "${feature_flags[@]}" -- --test-threads=2
+          cargo test --locked --workspace "${feature_flags[@]}" -- --test-threads=2
       - name: Verify working directory is clean
         run: git diff --exit-code
 
@@ -283,7 +283,7 @@ jobs:
           elif [[ -n "$FEATURES" ]]; then
             feature_flags+=(--features "$FEATURES")
           fi
-          cargo test \
+          cargo test --locked \
             --workspace \
             "${feature_flags[@]}" \
             --features expensive-tests \
@@ -360,7 +360,7 @@ jobs:
           elif [[ -n "$FEATURES" ]]; then
             feature_flags+=(--features "$FEATURES")
           fi
-          cargo build --workspace --all-targets "${feature_flags[@]}" --verbose
+          cargo build --locked --workspace --all-targets "${feature_flags[@]}" --verbose
       - name: Verify working directory is clean (excluding lockfile)
         run: git diff --exit-code ':!Cargo.lock'
 
@@ -477,7 +477,7 @@ jobs:
           persist-credentials: false
       # Build benchmarks to prevent bitrot
       - name: Build benchmarks
-        run: cargo build --all --benches
+        run: cargo build --locked --all --benches
 
   clippy:
     name: Clippy (MSRV)
@@ -519,7 +519,7 @@ jobs:
         env:
           TOOLCHAIN: ${{steps.toolchain.outputs.name}}
       - name: Run clippy (no default features)
-        run: cargo clippy --no-default-features -- -D warnings
+        run: cargo clippy --locked --no-default-features -- -D warnings
 
   clippy-beta:
     name: Clippy (beta)
@@ -617,7 +617,7 @@ jobs:
       - run: rustup override set "${TOOLCHAIN}"
         env:
           TOOLCHAIN: ${{steps.toolchain.outputs.name}}
-      - run: cargo fetch
+      - run: cargo fetch --locked
       # Requires #![deny(rustdoc::broken_intra_doc_links)] in crates.
       - name: Check intra-doc links
         shell: bash
@@ -632,7 +632,7 @@ jobs:
           elif [[ -n "$FEATURES" ]]; then
             feature_flags+=(--features "$FEATURES")
           fi
-          cargo doc --no-deps --workspace "${feature_flags[@]}" --document-private-items
+          cargo doc --locked --no-deps --workspace "${feature_flags[@]}" --document-private-items
 
   fmt:
     name: Rustfmt
@@ -682,7 +682,7 @@ jobs:
           elif [[ -n "$FEATURES" ]]; then
             feature_flags+=(--features "$FEATURES")
           fi
-          cargo check --workspace "${feature_flags[@]}"
+          cargo check --locked --workspace "${feature_flags[@]}"
       - name: run cargo-fmt to handle the case that regeneration sometimes produces unformatted output
         run: cargo fmt
       - name: Verify working directory is clean
